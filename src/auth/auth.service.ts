@@ -6,7 +6,12 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import { PrismaService } from '../prisma/prisma.service';
 import { envs } from '../config';
-import { LoginUserDto, RegisterUserDto } from './dto';
+import {
+  LoginUserDto,
+  LogoutDto,
+  RefreshTokenDto,
+  RegisterUserDto,
+} from './dto';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
 
 const BCRYPT_ROUNDS = 10;
@@ -51,15 +56,9 @@ export class AuthService {
       where: { email: dto.email.toLowerCase() },
     });
 
-    const invalid = () =>
-      new RpcException({
-        status: HttpStatus.UNAUTHORIZED,
-        message: 'Invalid credentials',
-      });
-
     if (!user) {
       await bcrypt.compare(dto.password, DUMMY_HASH);
-      throw invalid();
+      throw this.invalidCredentials();
     }
 
     if (!user.active) {
@@ -70,10 +69,95 @@ export class AuthService {
     }
 
     if (!(await bcrypt.compare(dto.password, user.passwordHash))) {
-      throw invalid();
+      throw this.invalidCredentials();
     }
 
     return this.buildSession(user);
+  }
+
+  async refresh(dto: RefreshTokenDto) {
+    const tokenHash = this.hashToken(dto.refreshToken);
+
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!stored) {
+      throw this.invalidRefreshToken();
+    }
+
+    if (stored.revokedAt) {
+      await this.prisma.refreshToken.updateMany({
+        where: { userId: stored.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+
+      this.logger.warn(
+        `Refresh token reuse detected for user ${stored.userId}. All sessions revoked.`,
+      );
+
+      throw this.invalidRefreshToken();
+    }
+
+    if (stored.expiresAt <= new Date()) {
+      throw this.invalidRefreshToken();
+    }
+
+    if (!stored.user.active) {
+      throw new RpcException({
+        status: HttpStatus.FORBIDDEN,
+        message: 'This account is disabled',
+      });
+    }
+
+    const rotated = randomBytes(32).toString('hex');
+    const expiresAt = this.refreshTokenExpiry();
+
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.update({
+        where: { id: stored.id },
+        data: { revokedAt: new Date() },
+      }),
+      this.prisma.refreshToken.create({
+        data: {
+          userId: stored.userId,
+          tokenHash: this.hashToken(rotated),
+          expiresAt,
+        },
+      }),
+    ]);
+
+    return {
+      accessToken: await this.signAccessToken(stored.user),
+      refreshToken: rotated,
+    };
+  }
+
+  async logout(dto: LogoutDto) {
+    await this.prisma.refreshToken.updateMany({
+      where: {
+        tokenHash: this.hashToken(dto.refreshToken),
+        userId: dto.userId,
+        revokedAt: null,
+      },
+      data: { revokedAt: new Date() },
+    });
+
+    return { ok: true };
+  }
+
+  async me(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user || !user.active) {
+      throw new RpcException({
+        status: HttpStatus.UNAUTHORIZED,
+        message: 'Invalid credentials',
+      });
+    }
+
+    return this.publicUser(user);
   }
 
   private async buildSession(user: {
@@ -82,44 +166,74 @@ export class AuthService {
     fullName: string;
     role: string;
   }) {
+    const [accessToken, refreshToken] = await Promise.all([
+      this.signAccessToken(user),
+      this.issueRefreshToken(user.id),
+    ]);
+
+    return { user: this.publicUser(user), accessToken, refreshToken };
+  }
+
+  private signAccessToken(user: { id: string; email: string; role: string }) {
     const payload: JwtPayload = {
       sub: user.id,
       email: user.email,
       role: user.role,
     };
 
-    const [accessToken, refreshToken] = await Promise.all([
-      this.jwtService.signAsync(payload),
-      this.issueRefreshToken(user.id),
-    ]);
-
-    return {
-      user: {
-        id: user.id,
-        email: user.email,
-        fullName: user.fullName,
-        role: user.role,
-      },
-      accessToken,
-      refreshToken,
-    };
+    return this.jwtService.signAsync(payload);
   }
 
   private async issueRefreshToken(userId: string) {
     const token = randomBytes(32).toString('hex');
 
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + envs.jwtRefreshExpiresInDays);
-
     await this.prisma.refreshToken.create({
-      data: { userId, tokenHash: this.hashToken(token), expiresAt },
+      data: {
+        userId,
+        tokenHash: this.hashToken(token),
+        expiresAt: this.refreshTokenExpiry(),
+      },
     });
 
     return token;
   }
 
+  private refreshTokenExpiry() {
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + envs.jwtRefreshExpiresInDays);
+    return expiresAt;
+  }
+
+  private publicUser(user: {
+    id: string;
+    email: string;
+    fullName: string;
+    role: string;
+  }) {
+    return {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      role: user.role,
+    };
+  }
+
   private hashToken(token: string) {
     return createHash('sha256').update(token).digest('hex');
+  }
+
+  private invalidCredentials() {
+    return new RpcException({
+      status: HttpStatus.UNAUTHORIZED,
+      message: 'Invalid credentials',
+    });
+  }
+
+  private invalidRefreshToken() {
+    return new RpcException({
+      status: HttpStatus.UNAUTHORIZED,
+      message: 'Invalid or expired refresh token',
+    });
   }
 
   private isUniqueViolation(error: unknown): boolean {
@@ -127,7 +241,7 @@ export class AuthService {
       typeof error === 'object' &&
       error !== null &&
       'code' in error &&
-      (error as { code: unknown }).code === 'P2002'
+      error.code === 'P2002'
     );
   }
 }

@@ -10,9 +10,14 @@ import { envs } from '../config';
   imports: [
     JwtModule.register({
       global: true,
-      secret: envs.jwtSecret,
+      privateKey: envs.jwtPrivateKey,
+      publicKey: envs.jwtPublicKey,
       signOptions: {
+        algorithm: 'RS256',
         expiresIn: envs.jwtAccessExpiresIn as SignOptions['expiresIn'],
+      },
+      verifyOptions: {
+        algorithms: ['RS256'],
       },
     }),
   ],
