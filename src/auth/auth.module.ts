@@ -4,6 +4,7 @@ import type { SignOptions } from 'jsonwebtoken';
 
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { RefreshTokenCleanupService } from './refresh-token-cleanup.service';
 import { envs } from '../config';
 
 @Module({
@@ -22,6 +23,6 @@ import { envs } from '../config';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService],
+  providers: [AuthService, RefreshTokenCleanupService],
 })
 export class AuthModule {}
