@@ -1,9 +1,10 @@
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 
 import { AppModule } from './app.module';
 import { envs } from './config';
+import { rpcValidationPipe } from './common/rpc-validation.pipe';
 
 async function bootstrap() {
   const logger = new Logger('AuthMS');
@@ -20,12 +21,7 @@ async function bootstrap() {
     },
   );
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-    }),
-  );
+  app.useGlobalPipes(rpcValidationPipe());
 
   await app.listen();
   logger.log(`Auth microservice listening on queue "${envs.rabbitmqQueue}"`);
